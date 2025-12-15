@@ -38,7 +38,7 @@ class BackgroundRemoverApp:
         title_label.pack(pady=(0, 10))
 
         # Instructions
-        instructions = "Add directories containing PNG images. Click 'Start Processing' to begin."
+        instructions = "Add directories like 'output_CcGAN...'. Click 'Start Processing' to begin."
         lbl_instructions = ttk.Label(main_frame, text=instructions, justify=tk.CENTER)
         lbl_instructions.pack(pady=(0, 10))
 
@@ -147,113 +147,142 @@ class BackgroundRemoverApp:
 
     def process_queue(self):
         total_images_all_dirs = 0
-        images_to_process = [] # List of (dir_index, image_path, output_dir)
+        tasks = [] # List of (dir_index, type, source, dest)
+                   # type='image': source=image_path, dest=output_path
+                   # type='csv': source=csv_path, dest=output_path
 
-        # First pass: Count total images and prepare work
+        # First pass: Scan and prepare work
         for i, input_dir in enumerate(self.directories):
             self.update_tree_status(i, "Scanning...", "0%")
             
-            dir_name = input_dir.name
-            base_output_path = Path("/home/fishman/Tools_Tam/background-remover/backgroundremover-for-microscope/background-removed")
-            output_dir = base_output_path / f"{dir_name}_backgournd-removed"
+            # Construct Base Output Directory Name: {Input_Dir}_bg_removed
+            # If input_dir is "output_CcGAN...", output is "output_CcGAN..._bg_removed"
+            output_base_dir_name = input_dir.name + "_bg_removed"
+            output_base_dir = input_dir.parent / output_base_dir_name
             
-            # Create output dir immediately
-            try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                self.log(f"Output directory created: {output_dir}")
-                
-                # Copy data.csv if it exists
-                data_csv_path = input_dir / "data.csv"
-                if data_csv_path.exists():
-                    try:
-                        shutil.copy2(data_csv_path, output_dir / "data.csv")
-                        self.log(f"Copied data.csv for {dir_name}")
-                    except Exception as e:
-                        self.log(f"Error copying data.csv for {dir_name}: {e}")
-
-            except Exception as e:
-                self.log(f"Error preparing {dir_name}: {e}")
-                self.update_tree_status(i, "Error", "0%")
+            saved_images_dir = input_dir / "saved_images"
+            if not saved_images_dir.exists():
+                self.log(f"Skipping {input_dir.name}: 'saved_images' folder not found.")
+                items = list(input_dir.glob("*.png")) # Fallback to old behavior? Or just error?
+                # The user requirement is specific. I will scan recursively just in case or strict?
+                # Strict adherence to requested structure:
+                # But let's look for saved_images. Only process if structure matches.
+                self.update_tree_status(i, "Invalid Struct", "0%")
                 continue
 
-            png_files = list(input_dir.glob("*.png"))
-            total_images_all_dirs += len(png_files)
-            
-            for png_file in png_files:
-                images_to_process.append((i, png_file, output_dir))
+            # Iterate over model folders inside saved_images
+            for model_dir in saved_images_dir.iterdir():
+                if not model_dir.is_dir(): continue
+                
+                # Iterate over numbered folders (1000, 2000, ...)
+                for numbered_dir in model_dir.iterdir():
+                    if not numbered_dir.is_dir(): continue
+                    # Check if it looks like a number (optional, but good safety)
+                    # User said "number foder like 2000"
+                    
+                    target_numbered_dir = output_base_dir / numbered_dir.name
+                    target_images_dir = target_numbered_dir / "images"
+
+                    # 1. Look for test.csv
+                    test_csv_path = numbered_dir / "test.csv"
+                    if test_csv_path.exists():
+                        target_csv_path = target_numbered_dir / "data.csv"
+                        tasks.append((i, 'csv', test_csv_path, target_csv_path))
+                    
+                    # 2. Look for images in 'test' folder
+                    test_images_dir = numbered_dir / "test"
+                    if test_images_dir.exists() and test_images_dir.is_dir():
+                        # Gather images
+                        # User mentioned "hoge.img". I'll assume standard extensions.
+                        # Using broad glob for images
+                        for ext in ["*.png", "*.jpg", "*.jpeg", "*.bmp"]:
+                            for img_path in test_images_dir.glob(ext):
+                                output_filename = f"{img_path.stem}_nobg.png"
+                                output_path = target_images_dir / output_filename
+                                tasks.append((i, 'image', img_path, output_path))
             
             self.update_tree_status(i, "Waiting", "0%")
 
-        if total_images_all_dirs == 0:
-            self.root.after(0, lambda: self.finish_processing("No PNG files found."))
+        # Filter image tasks for total count
+        image_tasks = [t for t in tasks if t[1] == 'image']
+        total_images_all_dirs = len(image_tasks)
+        
+        if not tasks:
+            self.root.after(0, lambda: self.finish_processing("No valid tasks found."))
             return
 
         self.log(f"Total images to process: {total_images_all_dirs}")
-        
+        self.log(f"Total CSVs to move: {len([t for t in tasks if t[1] == 'csv'])}")
+
         start_time = time.time()
-        processed_count = 0
+        processed_images_count = 0
         
         # Track progress per directory
-        dir_progress_map = {i: {"total": 0, "processed": 0} for i in range(len(self.directories))}
-        for i, _, _ in images_to_process:
-            dir_progress_map[i]["total"] += 1
+        # We need to map tasks back to directory index `i`
+        dir_progress_map = {i: {"total_images": 0, "processed_images": 0} for i in range(len(self.directories))}
+        for t in image_tasks:
+            dir_progress_map[t[0]]["total_images"] += 1
 
         # Mark first directory as Processing
-        if images_to_process:
-            current_dir_idx = images_to_process[0][0]
-            self.root.after(0, lambda: self.update_tree_status(current_dir_idx, "Processing", "0%"))
-
+        current_dir_idx = tasks[0][0]
+        self.root.after(0, lambda: self.update_tree_status(current_dir_idx, "Processing", "0%"))
         last_dir_idx = -1
 
-        for i, png_file, output_dir in images_to_process:
+        for task in tasks:
+            i, type_, source, dest = task
+            
             # Update directory status if changed
             if i != last_dir_idx:
                 if last_dir_idx != -1:
                      self.root.after(0, lambda idx=last_dir_idx: self.update_tree_status(idx, "DONE", "100%"))
-                self.root.after(0, lambda idx=i: self.update_tree_status(idx, "Processing", f"{int((dir_progress_map[idx]['processed']/dir_progress_map[idx]['total'])*100)}%"))
+                self.root.after(0, lambda idx=i: self.update_tree_status(idx, "Processing", 
+                    f"{int((dir_progress_map[idx]['processed_images']/dir_progress_map[idx]['total_images'])*100) if dir_progress_map[idx]['total_images'] > 0 else 0}%"))
                 last_dir_idx = i
 
             try:
-                self.status_var.set(f"Processing {png_file.name}...")
-                
-                # Read image
-                with open(png_file, "rb") as f:
-                    data = f.read()
+                # Ensure parent dir exists
+                dest.parent.mkdir(parents=True, exist_ok=True)
 
-                # Remove background
-                img_data = remove(data, model_name="u2net")
+                if type_ == 'csv':
+                    shutil.copy2(source, dest)
+                    # self.log(f"Copied CSV: {dest}") # Verbose logging can be reduced
 
-                # Save output
-                output_filename = f"{png_file.stem}_nobg.png"
-                output_path = output_dir / output_filename
+                elif type_ == 'image':
+                    self.status_var.set(f"Processing {source.name}...")
+                    
+                    with open(source, "rb") as f:
+                        data = f.read()
 
-                with open(output_path, "wb") as f:
-                    f.write(img_data)
-                
-                self.log(f"Saved: {output_filename}")
+                    # Remove background
+                    img_data = remove(data, model_name="u2net")
+
+                    with open(dest, "wb") as f:
+                        f.write(img_data)
+                    
+                    processed_images_count += 1
+                    dir_progress_map[i]["processed_images"] += 1
+                    
+                    # Update directory progress
+                    total_imgs = dir_progress_map[i]["total_images"]
+                    if total_imgs > 0:
+                        dir_percent = int((dir_progress_map[i]["processed_images"] / total_imgs) * 100)
+                        self.root.after(0, lambda idx=i, p=dir_percent: self.update_tree_status(idx, "Processing", f"{p}%"))
+
+                    # Update overall progress
+                    overall_percent = (processed_images_count / total_images_all_dirs) * 100
+                    self.root.after(0, lambda p=overall_percent: self.progress_var.set(p))
+
+                    # Update ETC
+                    elapsed_time = time.time() - start_time
+                    avg_time_per_image = elapsed_time / processed_images_count
+                    remaining_images = total_images_all_dirs - processed_images_count
+                    etc_seconds = avg_time_per_image * remaining_images
+                    etc_str = self.format_time(etc_seconds)
+                    
+                    self.root.after(0, lambda t=etc_str: self.lbl_etc.config(text=f"Estimated Time Remaining: {t}"))
 
             except Exception as e:
-                self.log(f"Error processing {png_file.name}: {e}")
-
-            processed_count += 1
-            dir_progress_map[i]["processed"] += 1
-            
-            # Update directory progress
-            dir_percent = int((dir_progress_map[i]["processed"] / dir_progress_map[i]["total"]) * 100)
-            self.root.after(0, lambda idx=i, p=dir_percent: self.update_tree_status(idx, "Processing", f"{p}%"))
-
-            # Update overall progress
-            overall_percent = (processed_count / total_images_all_dirs) * 100
-            self.root.after(0, lambda p=overall_percent: self.progress_var.set(p))
-
-            # Update ETC
-            elapsed_time = time.time() - start_time
-            avg_time_per_image = elapsed_time / processed_count
-            remaining_images = total_images_all_dirs - processed_count
-            etc_seconds = avg_time_per_image * remaining_images
-            etc_str = self.format_time(etc_seconds)
-            
-            self.root.after(0, lambda t=etc_str: self.lbl_etc.config(text=f"Estimated Time Remaining: {t}"))
+                self.log(f"Error processing {source}: {e}")
 
         # Mark last directory as DONE
         if last_dir_idx != -1:
